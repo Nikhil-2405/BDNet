@@ -6,7 +6,14 @@ This is an *unofficial* implementation written from the paper text (the authors'
 supplementary material were not available), so ambiguous details are marked "INTERPRETATION".
 
 Install:   pip install torch torchvision numpy pillow
-Run demo:  python bdnet.py          (sanity checks + tiny training run on synthetic data)
+Run:       python bdnet_interactive.py
+
+Interactive workflow:
+  1. Train on a labelled dataset in YOLO text format.
+  2. Run object detection on an image using a trained checkpoint.
+  3. Run internal model sanity checks.
+Important: this is an unofficial research re-implementation. Its simplified training loss
+is not the official YOLO12/Ultralytics loss; benchmark scores from the paper are not guaranteed.
 
 Paper component                      -> code
 -------------------------------------------------------------------------------------
@@ -543,8 +550,18 @@ class YoloTxtDataset(Dataset):
 
     def __init__(self, img_dir, label_dir, imgsz=640):
         from pathlib import Path
-        self.imgs = sorted(p for p in Path(img_dir).iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
-        self.label_dir, self.imgsz = Path(label_dir), imgsz
+        self.img_dir = Path(img_dir).expanduser()
+        self.label_dir = Path(label_dir).expanduser()
+        if not self.img_dir.is_dir():
+            raise FileNotFoundError(f"Image directory does not exist: {self.img_dir}")
+        if not self.label_dir.is_dir():
+            raise FileNotFoundError(f"Label directory does not exist: {self.label_dir}")
+        if imgsz < 64 or imgsz % 16 != 0:
+            raise ValueError("Image size must be at least 64 and divisible by 16 (for example, 256 or 640).")
+        self.imgs = sorted(p for p in self.img_dir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
+        if not self.imgs:
+            raise ValueError(f"No .jpg, .jpeg or .png images found in: {self.img_dir}")
+        self.imgsz = imgsz
 
     def __len__(self):
         return len(self.imgs)
@@ -555,7 +572,19 @@ class YoloTxtDataset(Dataset):
         img = Image.open(p).convert("RGB").resize((S, S))
         x = torch.from_numpy(np.asarray(img).copy()).permute(2, 0, 1).float() / 255
         lf = self.label_dir / f"{p.stem}.txt"
-        rows = np.loadtxt(lf, ndmin=2) if lf.exists() and lf.stat().st_size else np.zeros((0, 5))
+        try:
+            rows = np.loadtxt(lf, ndmin=2) if lf.exists() and lf.stat().st_size else np.zeros((0, 5))
+        except Exception as exc:
+            raise ValueError(f"Could not read label file {lf}: {exc}") from exc
+        if rows.size and (rows.ndim != 2 or rows.shape[1] != 5):
+            raise ValueError(f"Label file {lf} must have five columns: class_id cx cy width height")
+        if rows.size:
+            if not np.isfinite(rows).all():
+                raise ValueError(f"Label file {lf} contains NaN or infinite values")
+            if np.any(rows[:, 0] < 0) or np.any(rows[:, 1:] < 0) or np.any(rows[:, 1:] > 1):
+                raise ValueError(f"Label values in {lf} must be normalized to the range [0, 1]")
+            if np.any(rows[:, 3:] <= 0):
+                raise ValueError(f"Bounding-box width and height must be positive in {lf}")
         r = torch.from_numpy(rows).float()
         t = torch.stack([r[:, 0], (r[:, 1] - r[:, 3] / 2) * S, (r[:, 2] - r[:, 4] / 2) * S,
                          (r[:, 1] + r[:, 3] / 2) * S, (r[:, 2] + r[:, 4] / 2) * S], 1) if len(r) else torch.zeros(0, 5)
@@ -615,6 +644,365 @@ def train_demo(epochs=5, nc=3, device=None):
     print("detections (x1,y1,x2,y2,score,cls) top 5:\n", det[:5].cpu())
 
 
-if __name__ == "__main__":
+
+
+# ----------------------------------------------------------------------------------------
+# Interactive training and image inference
+# ----------------------------------------------------------------------------------------
+def _prompt_text(label: str, default: str | None = None) -> str:
+    suffix = f" [{default}]" if default is not None else ""
+    value = input(f"{label}{suffix}: ").strip()
+    return value if value else (default or "")
+
+
+def _prompt_int(label: str, default: int, minimum: int = 1) -> int:
+    while True:
+        raw = _prompt_text(label, str(default))
+        try:
+            value = int(raw)
+            if value < minimum:
+                raise ValueError
+            return value
+        except ValueError:
+            print(f"Please enter a whole number greater than or equal to {minimum}.")
+
+
+def _prompt_float(label: str, default: float, minimum: float, maximum: float) -> float:
+    while True:
+        raw = _prompt_text(label, str(default))
+        try:
+            value = float(raw)
+            if not minimum <= value <= maximum:
+                raise ValueError
+            return value
+        except ValueError:
+            print(f"Please enter a number from {minimum} to {maximum}.")
+
+
+def _prompt_path(label: str, must_exist: bool = True, is_dir: bool | None = None) -> str:
+    from pathlib import Path
+    while True:
+        raw = input(f"{label}: ").strip().strip('"').strip("'")
+        if not raw:
+            print("A path is required.")
+            continue
+        path = Path(raw).expanduser()
+        if must_exist and not path.exists():
+            print(f"Path not found: {path}")
+            continue
+        if must_exist and is_dir is True and not path.is_dir():
+            print("Please enter a directory path.")
+            continue
+        if must_exist and is_dir is False and not path.is_file():
+            print("Please enter a file path.")
+            continue
+        if not must_exist and path.exists():
+            answer = input(f"{path} already exists. Overwrite it? [y/N]: ").strip().lower()
+            if answer not in {"y", "yes"}:
+                continue
+        return str(path)
+
+
+def _select_device() -> torch.device:
+    available = torch.cuda.is_available()
+    default = "cuda" if available else "cpu"
+    choice = _prompt_text("Compute device (auto/cpu/cuda)", "auto").lower()
+    if choice in {"auto", ""}:
+        choice = default
+    if choice == "cuda" and not available:
+        print("CUDA is not available in this PyTorch installation; using CPU instead.")
+        choice = "cpu"
+    if choice not in {"cpu", "cuda"}:
+        print("Unrecognised device choice; using", default)
+        choice = default
+    device = torch.device(choice)
+    print(f"Using device: {device}")
+    return device
+
+
+def _mean_losses(model, loader, loss_fn, device, optimizer=None):
+    training = optimizer is not None
+    model.train(training)
+    totals = {"total": 0.0, "box": 0.0, "cls": 0.0, "dfl": 0.0}
+    batches = 0
+    context = torch.enable_grad() if training else torch.no_grad()
+    with context:
+        for images, targets in loader:
+            images = images.to(device, non_blocking=(device.type == "cuda"))
+            targets = [target.to(device) for target in targets]
+            losses = loss_fn(model(images), targets)
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+                losses["total"].backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                optimizer.step()
+            for key in totals:
+                totals[key] += float(losses[key].detach().cpu())
+            batches += 1
+    if batches == 0:
+        raise RuntimeError("The data loader produced no batches. Check the image directory.")
+    return {key: value / batches for key, value in totals.items()}
+
+
+def train_on_yolo_dataset():
+    """Train BDNet from a user-supplied YOLO-format dataset and save a checkpoint."""
+    from pathlib import Path
+
+    print("\n=== TRAIN BDNET ON A LABELLED DATASET ===")
+    print("Expected labels: one .txt file per image, with rows: class_id cx cy width height")
+    print("The four box values must be normalized between 0 and 1.\n")
+
+    class_text = input("Enter class names in label-ID order, separated by commas\n"
+                       "Example: pedestrian,car,bicycle,bus: ").strip()
+    class_names = [name.strip() for name in class_text.split(",") if name.strip()]
+    if not class_names:
+        raise ValueError("At least one class name is required.")
+    nc = len(class_names)
+
+    train_img = _prompt_path("Training images directory", is_dir=True)
+    train_lbl = _prompt_path("Training labels directory", is_dir=True)
+    val_img_raw = input("Validation images directory (press Enter to skip): ").strip().strip('"').strip("'")
+    val_lbl_raw = input("Validation labels directory (press Enter to skip): ").strip().strip('"').strip("'")
+    if bool(val_img_raw) != bool(val_lbl_raw):
+        raise ValueError("Provide both validation image and label directories, or leave both blank.")
+
+    imgsz = _prompt_int("Input image size (must be divisible by 16)", 256, 64)
+    if imgsz % 16 != 0:
+        raise ValueError("Image size must be divisible by 16, for example 256, 320, 512 or 640.")
+    epochs = _prompt_int("Number of training epochs", 20, 1)
+    batch_size = _prompt_int("Batch size", 4, 1)
+    learning_rate = _prompt_float("Learning rate", 0.001, 1e-6, 1.0)
+    output_path = _prompt_path("Checkpoint output path", must_exist=False)
+    if Path(output_path).suffix.lower() not in {".pt", ".pth"}:
+        output_path += ".pt"
+
+    train_ds = YoloTxtDataset(train_img, train_lbl, imgsz=imgsz)
+    val_ds = YoloTxtDataset(val_img_raw, val_lbl_raw, imgsz=imgsz) if val_img_raw else None
+
+    # Validate all label class IDs before starting a potentially long training run.
+    for dataset_name, dataset in (("training", train_ds), ("validation", val_ds)):
+        if dataset is None:
+            continue
+        for i, image_path in enumerate(dataset.imgs):
+            label_path = dataset.label_dir / f"{image_path.stem}.txt"
+            if label_path.exists() and label_path.stat().st_size:
+                rows = np.loadtxt(label_path, ndmin=2)
+                if rows.size and (np.any(rows[:, 0] >= nc) or np.any(rows[:, 0] != np.floor(rows[:, 0]))):
+                    raise ValueError(
+                        f"Class IDs in {label_path} must be integers from 0 to {nc - 1}. "
+                        f"Your class names are: {class_names}"
+                    )
+        print(f"{dataset_name.capitalize()} images found: {len(dataset)}")
+
+    device = _select_device()
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate,
+        num_workers=0, pin_memory=(device.type == "cuda")
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate,
+        num_workers=0, pin_memory=(device.type == "cuda")
+    ) if val_ds is not None else None
+
+    model = BDNet(nc=nc).to(device)
+    loss_fn = SimpleDetectionLoss(nc=nc).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    best_loss = float("inf")
+    output = Path(output_path).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"\nClasses ({nc}): {class_names}")
+    print(f"Model parameters: {count_params(model):.2f} million")
+    print("Training started. Loss values are optimization indicators, not accuracy percentages.\n")
+
+    for epoch in range(1, epochs + 1):
+        train_stats = _mean_losses(model, train_loader, loss_fn, device, optimizer)
+        if val_loader is not None:
+            val_stats = _mean_losses(model, val_loader, loss_fn, device)
+            selection_loss = val_stats["total"]
+            val_text = (f"val_loss={val_stats['total']:.4f} "
+                        f"(box={val_stats['box']:.4f}, cls={val_stats['cls']:.4f}, dfl={val_stats['dfl']:.4f})")
+        else:
+            selection_loss = train_stats["total"]
+            val_text = "validation skipped"
+
+        print(
+            f"Epoch {epoch:>3}/{epochs} | train_loss={train_stats['total']:.4f} "
+            f"(box={train_stats['box']:.4f}, cls={train_stats['cls']:.4f}, dfl={train_stats['dfl']:.4f}) | {val_text}"
+        )
+
+        # Keep the checkpoint with the lowest validation loss (or last training loss if no validation set).
+        if selection_loss < best_loss:
+            best_loss = selection_loss
+            payload = {
+                "model_state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                "nc": nc,
+                "class_names": class_names,
+                "imgsz": imgsz,
+                "channels": (16, 32, 64, 128),
+                "neck_ch": 64,
+                "reg_max": 16,
+                "best_selection_loss": best_loss,
+                "epoch": epoch,
+                "training_note": "Unofficial BDNet re-implementation with SimpleDetectionLoss; not official YOLO12 loss.",
+            }
+            torch.save(payload, output)
+            print(f"  Saved best checkpoint: {output}")
+
+    print("\nTraining finished.")
+    print(f"Best selection loss: {best_loss:.4f}")
+    print(f"Checkpoint: {output.resolve()}")
+    print("Next step: choose image detection and load this checkpoint.")
+
+
+def _load_checkpoint(checkpoint_path: str, device: torch.device):
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:  # compatibility with older PyTorch releases
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+        raise ValueError(
+            "This file is not a checkpoint saved by the interactive training option. "
+            "Train the model first or provide a compatible checkpoint."
+        )
+    nc = int(checkpoint["nc"])
+    class_names = checkpoint.get("class_names", [f"class_{i}" for i in range(nc)])
+    imgsz = int(checkpoint.get("imgsz", 256))
+    channels = tuple(checkpoint.get("channels", (16, 32, 64, 128)))
+    neck_ch = int(checkpoint.get("neck_ch", 64))
+    reg_max = int(checkpoint.get("reg_max", 16))
+    model = BDNet(nc=nc, chs=channels, neck_ch=neck_ch, reg_max=reg_max).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    model.eval()
+    return model, class_names, imgsz, checkpoint
+
+
+def detect_in_user_image():
+    """Run inference on one image, save an annotated image and a CSV file."""
+    import csv
+    from pathlib import Path
+    from PIL import Image, ImageDraw, ImageFont
+
+    print("\n=== DETECT OBJECTS IN AN IMAGE ===")
+    checkpoint_path = _prompt_path("Trained BDNet checkpoint (.pt/.pth)", is_dir=False)
+    image_path = _prompt_path("Input image path", is_dir=False)
+    device = _select_device()
+    model, class_names, imgsz, checkpoint = _load_checkpoint(checkpoint_path, device)
+
+    conf = _prompt_float("Confidence threshold (0 to 1)", 0.25, 0.0, 1.0)
+    iou = _prompt_float("IoU threshold for NMS (0 to 1)", 0.60, 0.0, 1.0)
+    max_det = _prompt_int("Maximum detections to return", 100, 1)
+
+    original = Image.open(image_path).convert("RGB")
+    original_w, original_h = original.size
+    resized = original.resize((imgsz, imgsz), Image.Resampling.BILINEAR)
+    image_tensor = torch.from_numpy(np.asarray(resized).copy()).permute(2, 0, 1).float().div(255.0)
+    image_tensor = image_tensor.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        detections = model.predict(image_tensor, conf_thres=conf, iou_thres=iou, max_det=max_det)[0]
+
+    annotated = original.copy()
+    draw = ImageDraw.Draw(annotated)
+    try:
+        font = ImageFont.truetype("arial.ttf", size=max(12, original_w // 60))
+    except OSError:
+        font = ImageFont.load_default()
+
+    stem = Path(image_path).stem
+    output_image = Path(image_path).with_name(f"{stem}_bdnet_result.jpg")
+    output_csv = Path(image_path).with_name(f"{stem}_bdnet_detections.csv")
+    rows = []
+    sx, sy = original_w / imgsz, original_h / imgsz
+
+    for det in detections.detach().cpu().tolist():
+        x1, y1, x2, y2, score, class_id_float = det
+        class_id = int(class_id_float)
+        # The model sees a stretched square image; map the predicted coordinates back per axis.
+        x1 = min(max(x1 * sx, 0.0), float(original_w - 1))
+        x2 = min(max(x2 * sx, 0.0), float(original_w - 1))
+        y1 = min(max(y1 * sy, 0.0), float(original_h - 1))
+        y2 = min(max(y2 * sy, 0.0), float(original_h - 1))
+        class_name = class_names[class_id] if 0 <= class_id < len(class_names) else f"class_{class_id}"
+        label = f"{class_name} {score:.2f}"
+        draw.rectangle((x1, y1, x2, y2), outline=(255, 40, 40), width=max(2, original_w // 400))
+        text_box = draw.textbbox((x1, y1), label, font=font)
+        draw.rectangle(text_box, fill=(255, 40, 40))
+        draw.text((x1, y1), label, fill=(255, 255, 255), font=font)
+        rows.append({
+            "class_id": class_id,
+            "class_name": class_name,
+            "confidence": round(float(score), 6),
+            "x_min": round(x1, 2),
+            "y_min": round(y1, 2),
+            "x_max": round(x2, 2),
+            "y_max": round(y2, 2),
+        })
+
+    annotated.save(output_image, quality=95)
+    with output_csv.open("w", newline="", encoding="utf-8") as file:
+        fieldnames = ["class_id", "class_name", "confidence", "x_min", "y_min", "x_max", "y_max"]
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print("\n=== DETECTION SUMMARY ===")
+    print(f"Input image: {image_path}")
+    print(f"Image size: {original_w} x {original_h} pixels")
+    print(f"Checkpoint epoch: {checkpoint.get('epoch', 'unknown')}")
+    print(f"Confidence threshold: {conf:.2f} | NMS IoU threshold: {iou:.2f}")
+    print(f"Objects detected: {len(rows)}")
+    if rows:
+        for index, row in enumerate(rows, start=1):
+            print(
+                f"{index}. {row['class_name']} | confidence={row['confidence']:.3f} | "
+                f"box=({row['x_min']}, {row['y_min']}, {row['x_max']}, {row['y_max']})"
+            )
+    else:
+        print("No object passed the selected confidence threshold.")
+    print(f"\nAnnotated image saved to: {output_image}")
+    print(f"Detection details saved to: {output_csv}")
+    print("\nInterpretation: confidence is the model's score for a predicted class, not a guarantee of correctness.")
+
+
+def run_sanity_checks():
+    print("\nRunning BDNet module and tensor-shape checks...")
     sanity_checks()
-    train_demo()
+    print("These checks verify code execution and tensor dimensions; they do not measure detection accuracy.")
+
+
+def interactive_menu():
+    print("=" * 72)
+    print("BDNet - BIO-INSPIRED DUAL-BACKBONE SMALL OBJECT DETECTION")
+    print("=" * 72)
+    print("This program can train on your labelled dataset or detect objects using trained weights.")
+    print("For real image detection, train the network first or provide a compatible checkpoint.")
+
+    while True:
+        print("\nChoose an operation:")
+        print("  1. Train BDNet using a YOLO-format dataset")
+        print("  2. Detect objects in an image using a trained checkpoint")
+        print("  3. Run model sanity checks")
+        print("  4. Exit")
+        choice = input("Enter choice (1-4): ").strip()
+        try:
+            if choice == "1":
+                train_on_yolo_dataset()
+            elif choice == "2":
+                detect_in_user_image()
+            elif choice == "3":
+                run_sanity_checks()
+            elif choice == "4":
+                print("Exiting BDNet. Goodbye.")
+                break
+            else:
+                print("Please select 1, 2, 3 or 4.")
+        except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
+            print(f"\nOperation could not be completed: {exc}")
+            print("Check the paths, dataset labels and settings, then try again.")
+        except KeyboardInterrupt:
+            print("\nOperation cancelled by user.")
+
+
+if __name__ == "__main__":
+    interactive_menu()
